@@ -1,8 +1,32 @@
 import "dotenv/config"
 import http from "http"
 import fs from "fs"
+import path from "path"
 import { NVIDIAClient, GeminiClient } from "./ai"
-import { isMailerConfigured, sendInterestEmail, InterestApplication } from "./mailer"
+import { isMailerConfigured, sendInterestEmail, sendPasswordResetCode, InterestApplication } from "./mailer"
+import {
+  ConversationRecord,
+  findUserByEmail,
+  generateId,
+  listConversationsForUser,
+  readConversation,
+  writeConversation,
+  deleteConversation
+} from "./storage"
+import {
+  RegistrationInput,
+  validateRegistrationInput,
+  registerUser,
+  authenticate,
+  createSession,
+  revokeSessionByCookie,
+  getSessionUser,
+  sessionCookieHeader,
+  clearSessionCookieHeader,
+  toPublicUser,
+  issuePasswordReset,
+  consumePasswordReset
+} from "./auth"
 
 type Message = {
   role: "system" | "user" | "assistant"
@@ -14,7 +38,8 @@ const memory: Map<string, Message[]> = new Map()
 const SARAH_CONTEXT = `
 IDENTITY:
 You are Sarah (سارة), the assistant of Youth Science Club (YSC).
-Sarah is NOT a university student and does NOT study at the Faculty of Agriculture, Saba Basha.
+Sarah is NOT a university student. She does not study at the Faculty of Agriculture, Saba Basha, or at any other faculty, and she never says or implies that she studies anywhere.
+If asked about her studies, her faculty, or her college life, she answers naturally that she is not a student - she is the AI assistant of YSC.
 Sarah is a friendly, human-like personality for YSC, not a corporate chatbot.
 
 In Arabic, introduce yourself simply as "أنا سارة" and explain naturally who you are.
@@ -46,6 +71,9 @@ CONVERSATION BEHAVIOR:
 - Match the user's language: Egyptian Arabic gets Egyptian Arabic, English gets English, mixed gets a natural mix.
 - Answer the user's actual question first, and answer every meaningful part of it.
 - When the user asks who Sarah is or what she can help with, answer directly and naturally based on what you know.
+- If the user asks about any topic (science, technology, history, education, programming, agriculture, health, movies, books, travel, everyday life, or anything else), answer THAT question directly and usefully.
+- A scientific question (like CRISPR, genetics, physics, or chemistry) gets a proper, complete scientific answer. Never turn a scientific answer into a YSC promotional answer and never end it with a YSC invitation unless the user asks about YSC.
+- Do NOT redirect the conversation to YSC and do NOT mention YSC unless the user asks about it or it is genuinely relevant to the answer.
 - Simple question = short simple answer. Complex question = clear explanation.
 - Keep answers proportional to the question. No generic filler.
 - Always complete every sentence you start and finish your idea before ending the reply. Never use "..." as filler or ending.
@@ -92,6 +120,16 @@ After the user explicitly confirms sending:
 GENERAL KNOWLEDGE:
 Sarah can use her general knowledge to answer normal questions that are not specifically about YSC: fashion, everyday life, technology, science, study tips, hobbies, ideas, entertainment, and general questions.
 Not every question must be about YSC. She stays Sarah in every topic.
+When a question is about any subject other than YSC, she answers that subject properly, in useful detail, exactly as the question deserves. YSC is only mentioned when the user brings it up or when the connection is genuinely relevant.
+
+WEB RESEARCH:
+- Sarah has access to a real web search tool. When the question involves current events, recent news, new discoveries, new technology, current prices, schedules, current people or organizations, or anything that changes over time, she should search first instead of guessing.
+- She may also search for niche or unfamiliar topics where answering from memory alone could be wrong.
+- She should NOT search for simple conversation, greetings, or stable well-known knowledge she is sure about. Searching is for when it genuinely adds value.
+- If she used the search tool and it returned results, she may mention naturally that she looked it up.
+- If she did NOT search, she must never claim that she searched or browsed anything.
+- If the search tool fails, returns no useful results, or the results do not confirm the information, she says clearly and naturally that the information could not be verified, and she never presents unverified information as fact.
+- She never invents news, dates, prices, statistics, sources, or search results.
 
 IMPORTANT FACTUAL RULE:
 When a question is specifically about Youth Science Club, its history, people, achievements, events, projects, partnerships, or Faculty of Agriculture Saba Basha information provided in this context:
@@ -101,7 +139,9 @@ When a question is specifically about Youth Science Club, its history, people, a
 - Do not present uncertain information as fact.
 
 YOUTH SCIENCE CLUB:
-Youth Science Club (YSC) is a scientific student community associated with the Faculty of Agriculture, Saba Basha, Alexandria University.
+Youth Science Club (YSC) is a student scientific community and initiative operating at the level of Alexandria University.
+Its origin and historic base is the Faculty of Agriculture, Saba Basha, Alexandria University, and that faculty remains an important part of YSC's context, history, and activities - but YSC's identity is NOT limited to being "the team at the Faculty of Agriculture, Saba Basha".
+When describing YSC, present it as an Alexandria University-level student scientific community, and mention the Faculty of Agriculture, Saba Basha only as part of its origin and context.
 
 Core idea:
 Give students a real space to ask questions, explore, experiment, develop ideas, conduct research, build skills, meet specialists, and turn ideas into real projects.
@@ -367,156 +407,549 @@ IDENTITY SAFETY (highest priority - overrides everything above):
   Do not add any technical information and do not associate Ahmed with any model, API, or backend.
 `
 
+const PUBLIC_DIR = path.join(__dirname, "..", "public")
+
+const STATIC_FILES: Record<string, { file: string; type: string }> = {
+  "/": { file: "index.html", type: "text/html; charset=utf-8" },
+  "/index.html": { file: "index.html", type: "text/html; charset=utf-8" },
+  "/style.css": { file: "style.css", type: "text/css; charset=utf-8" },
+  "/app.js": { file: "app.js", type: "text/javascript; charset=utf-8" },
+  "/auth.js": { file: "auth.js", type: "text/javascript; charset=utf-8" },
+  "/chat.js": { file: "chat.js", type: "text/javascript; charset=utf-8" },
+  "/sarah.png": { file: "sarah.png", type: "image/png" },
+  "/favicon.svg": { file: "favicon.svg", type: "image/svg+xml" }
+}
+
+const MAX_BODY_BYTES = 100 * 1024
+
+type JsonBodyResult =
+  | { ok: true; data: any }
+  | { ok: false; status: number; error: string }
+
+function readJsonBody(req: http.IncomingMessage): Promise<JsonBodyResult> {
+  return new Promise(resolve => {
+    const contentType = String(req.headers["content-type"] || "").toLowerCase()
+    if (!contentType.includes("application/json")) {
+      resolve({ ok: false, status: 415, error: "Content-Type must be application/json" })
+      return
+    }
+
+    let body = ""
+
+    req.on("data", (chunk: string) => {
+      body += chunk
+      if (Buffer.byteLength(body, "utf8") > MAX_BODY_BYTES) {
+        req.removeAllListeners("data")
+        req.removeAllListeners("end")
+        req.resume()
+        resolve({ ok: false, status: 413, error: "Request body too large" })
+      }
+    })
+
+    req.on("end", () => {
+      try {
+        resolve({ ok: true, data: JSON.parse(body) })
+      } catch {
+        resolve({ ok: false, status: 400, error: "Invalid JSON body" })
+      }
+    })
+
+    req.on("error", () => {
+      resolve({ ok: false, status: 400, error: "Failed to read request body" })
+    })
+  })
+}
+
+function respondJson(
+  res: http.ServerResponse,
+  status: number,
+  payload: unknown,
+  headers?: Record<string, string>
+): void {
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    ...(headers || {})
+  })
+  res.end(JSON.stringify(payload))
+}
+
+const DEFAULT_CONVERSATION_TITLE = "محادثة جديدة"
+const CHAT_HISTORY_LIMIT = 40
+const MAX_MESSAGE_LENGTH = 8000
+
+async function processSarahReply(chatMessages: Message[]): Promise<string> {
+  const llmProvider = (process.env.LLM_PROVIDER || "gemini").toLowerCase()
+
+  let reply: string
+  try {
+    if (llmProvider === "gemini") {
+      const geminiClient = new GeminiClient()
+      reply = await geminiClient.getReply(chatMessages)
+    } else {
+      const nvidiaClient = new NVIDIAClient()
+      reply = await nvidiaClient.getReply(chatMessages)
+    }
+  } catch (providerErr) {
+    if (llmProvider === "gemini") {
+      console.log("Gemini failed, falling back to NVIDIA:", (providerErr as Error).message)
+      const nvidiaClient = new NVIDIAClient()
+      reply = await nvidiaClient.getReply(chatMessages)
+    } else {
+      throw providerErr
+    }
+  }
+
+  // High-precision identity-leak guard.
+  // Only blocks brand names and self-referential leak phrasing.
+  // Generic words (model, api, llm, provider, backend, developer) are allowed
+  // when they are part of a legitimate answer to the user's actual question.
+  const identityLeakPatterns = [
+    /nemotron/i,
+    /\bnvidia\b/i,
+    /نيموتر|نيموترون|نفيديا|إنفيديا/i,
+    /\b(?:i\s+am|i'?m)\s+(?:an?\s+)?(?:ai\s+|large\s+language\s+|language\s+)*(?:model|llm)\b/i,
+    /\bmy\s+(?:underlying\s+)?(?:model|provider|api|backend|system\s+prompt|system\s+instructions|developer\s+instructions|technical\s+implementation)\b/i,
+    /\bi\s+was\s+(?:trained|developed|built|created|made|programmed)\b/i,
+    /\b(?:trained|developed|built|created|made|powered|hosted|run)\s+(?:by|on|using|with)\s+(?:nvidia|nemotron|z-?ai|glm|gemini|openai|anthropic)\b/i,
+    /\bdeveloper\s+instructions\b/i,
+    /(?:بستخدم|شغالة|مبنية|متعملة|متبرمجة|متدربة)\s+(?:على|بواسطة|ب|من)\s*(?:نموذج|موديل|GLM|Gemini|منصة)/i,
+    /أنا\s+(?:موديل|نموذج)\s*(?:لغوي|ذكاء|AI)?/i
+  ]
+
+  const matchedLeakPatterns = identityLeakPatterns
+    .filter(pattern => pattern.test(reply))
+    .map(pattern => pattern.source)
+
+  const hasIdentityLeak = matchedLeakPatterns.length > 0
+
+  if (hasIdentityLeak) {
+    console.log(`Identity guard: reply blocked (matched: ${matchedLeakPatterns.join(", ")})`)
+    reply = "أنا سارة 🤍 المساعدة بتاعة Youth Science Club. لو بتسألني أنا مين، فأنا هنا عشان أساعدك في كل حاجة تخص النادي وأنشطته ومجتمعه."
+  }
+
+  let finalReply = reply
+
+  const applicationMatch = reply.match(/\[\[APPLICATION\]\]\s*([\s\S]*?)\s*\[\[\/APPLICATION\]\]/)
+
+  if (applicationMatch) {
+    finalReply = reply.replace(/\[\[APPLICATION\][\s\S]*?\[\[\/APPLICATION\]\]/, "").trim()
+
+    try {
+      const application = JSON.parse(applicationMatch[1]) as InterestApplication
+
+      const logLine = JSON.stringify({
+        receivedAt: new Date().toISOString(),
+        application
+      })
+      fs.appendFileSync("applications.log", logLine + "\n", "utf8")
+      console.log("Application collected and stored")
+
+      if (isMailerConfigured()) {
+        try {
+          await sendInterestEmail(application)
+          console.log("Application email sent")
+        } catch (mailErr) {
+          console.error("Application email failed:", (mailErr as Error).message)
+        }
+      } else {
+        console.log("Mailer not configured - application stored in applications.log only")
+      }
+    } catch (parseErr) {
+      console.error("Application block parse failed:", (parseErr as Error).message)
+    }
+  }
+
+  return finalReply
+}
+
 const server = http.createServer(async (req, res) => {
-  if (req.method === "POST" && req.url === "/chat") {
+  if (req.method === "POST" && req.url === "/api/auth/register") {
+    const bodyResult = await readJsonBody(req)
+    if (!bodyResult.ok) {
+      respondJson(res, bodyResult.status, { error: bodyResult.error })
+      return
+    }
+
+    const data = bodyResult.data
+    if (
+      typeof data.fullName !== "string" ||
+      typeof data.email !== "string" ||
+      typeof data.password !== "string" ||
+      typeof data.confirmPassword !== "string"
+    ) {
+      respondJson(res, 400, { error: "Invalid request body." })
+      return
+    }
+
+    const input: RegistrationInput = {
+      fullName: data.fullName,
+      email: data.email,
+      password: data.password,
+      confirmPassword: data.confirmPassword
+    }
+
+    const validationError = validateRegistrationInput(input)
+    if (validationError) {
+      respondJson(res, 400, { error: validationError })
+      return
+    }
+
+    const result = registerUser(input)
+    if (!result.ok) {
+      respondJson(res, 409, { error: "An account with this email already exists." })
+      return
+    }
+
+    const session = createSession(result.user.id)
+    console.log(`Auth: user registered (${result.user.id})`)
+    respondJson(res, 201, { user: toPublicUser(result.user) }, {
+      "Set-Cookie": sessionCookieHeader(session.token)
+    })
+  } else if (req.method === "POST" && req.url === "/api/auth/login") {
+    const bodyResult = await readJsonBody(req)
+    if (!bodyResult.ok) {
+      respondJson(res, bodyResult.status, { error: bodyResult.error })
+      return
+    }
+
+    const data = bodyResult.data
+    if (typeof data.email !== "string" || typeof data.password !== "string") {
+      respondJson(res, 400, { error: "Email and password are required." })
+      return
+    }
+
+    const user = authenticate(data.email, data.password)
+    if (!user) {
+      console.log("Auth: login failed")
+      respondJson(res, 401, { error: "The email or password is incorrect." })
+      return
+    }
+
+    const session = createSession(user.id)
+    console.log(`Auth: login ok (${user.id})`)
+    respondJson(res, 200, { user: toPublicUser(user) }, {
+      "Set-Cookie": sessionCookieHeader(session.token)
+    })
+  } else if (req.method === "POST" && req.url === "/api/auth/logout") {
+    revokeSessionByCookie(req.headers.cookie)
+    respondJson(res, 200, { ok: true }, {
+      "Set-Cookie": clearSessionCookieHeader()
+    })
+  } else if (req.method === "GET" && req.url === "/api/auth/me") {
+    const user = getSessionUser(req.headers.cookie)
+    if (!user) {
+      respondJson(res, 401, { error: "Not authenticated" })
+      return
+    }
+    respondJson(res, 200, { user: toPublicUser(user) })
+  } else if (req.method === "POST" && req.url === "/api/auth/forgot-password") {
+    const bodyResult = await readJsonBody(req)
+    if (!bodyResult.ok) {
+      respondJson(res, bodyResult.status, { error: bodyResult.error })
+      return
+    }
+
+    const data = bodyResult.data
+    if (typeof data.email !== "string") {
+      respondJson(res, 400, { error: "Email is required." })
+      return
+    }
+
+    const issued = issuePasswordReset(data.email)
+    if (issued) {
+      console.log(`Auth: reset code issued (${issued.user.id})`)
+      if (isMailerConfigured()) {
+        try {
+          await sendPasswordResetCode(issued.user.email, issued.code, issued.user.fullName)
+          console.log("Auth: reset code email sent")
+        } catch (mailErr) {
+          console.error("Auth: reset code email failed:", (mailErr as Error).message)
+        }
+      } else {
+        console.log("Auth: reset code generated but mailer not configured")
+      }
+    }
+
+    respondJson(res, 200, {
+      ok: true,
+      message: "If the email is registered, a reset code has been sent to it."
+    })
+  } else if (req.method === "POST" && req.url === "/api/auth/reset-password") {
+    const bodyResult = await readJsonBody(req)
+    if (!bodyResult.ok) {
+      respondJson(res, bodyResult.status, { error: bodyResult.error })
+      return
+    }
+
+    const data = bodyResult.data
+    if (typeof data.email !== "string" || typeof data.code !== "string" || typeof data.newPassword !== "string") {
+      respondJson(res, 400, { error: "Email, code, and new password are required." })
+      return
+    }
+
+    if (data.newPassword.length < 8 || data.newPassword.length > 128) {
+      respondJson(res, 400, { error: "Password must be between 8 and 128 characters." })
+      return
+    }
+
+    const result = consumePasswordReset(data.email, data.code, data.newPassword)
+
+    if (result === "OK") {
+      console.log("Auth: password reset completed")
+      respondJson(res, 200, {
+        ok: true,
+        message: "Password has been reset. You can now log in with your new password."
+      })
+    } else if (result === "TOO_MANY_ATTEMPTS") {
+      respondJson(res, 429, { error: "Too many attempts. Please request a new code." })
+    } else {
+      respondJson(res, 400, { error: "The reset code is invalid or has expired." })
+    }
+  } else if (req.method === "POST" && req.url === "/api/conversations") {
+    const user = getSessionUser(req.headers.cookie)
+    if (!user) {
+      respondJson(res, 401, { error: "Not authenticated" })
+      return
+    }
+
+    const now = new Date().toISOString()
+    const conversation: ConversationRecord = {
+      id: generateId("c"),
+      userId: user.id,
+      title: DEFAULT_CONVERSATION_TITLE,
+      createdAt: now,
+      updatedAt: now,
+      messages: []
+    }
+    writeConversation(conversation)
+    respondJson(res, 201, { conversation })
+  } else if (req.method === "POST" && req.url === "/api/chat") {
+    const user = getSessionUser(req.headers.cookie)
+    if (!user) {
+      respondJson(res, 401, { error: "Not authenticated" })
+      return
+    }
+
+    const bodyResult = await readJsonBody(req)
+    if (!bodyResult.ok) {
+      respondJson(res, bodyResult.status, { error: bodyResult.error })
+      return
+    }
+
+    const data = bodyResult.data
+    if (typeof data.conversationId !== "string" || typeof data.message !== "string" || !data.message.trim()) {
+      respondJson(res, 400, { error: "conversationId and message are required." })
+      return
+    }
+
+    if (data.message.length > MAX_MESSAGE_LENGTH) {
+      respondJson(res, 400, { error: "Message is too long." })
+      return
+    }
+
+    const conversation = readConversation(data.conversationId)
+    if (!conversation || conversation.userId !== user.id) {
+      respondJson(res, 404, { error: "Conversation not found." })
+      return
+    }
+
+    try {
+      const now = new Date().toISOString()
+      conversation.messages.push({ role: "user", content: data.message, ts: now })
+
+      if (!conversation.title || conversation.title === DEFAULT_CONVERSATION_TITLE) {
+        conversation.title = data.message.trim().replace(/\s+/g, " ").slice(0, 60)
+      }
+      conversation.updatedAt = now
+
+      const chatMessages: Message[] = [
+        { role: "system", content: SARAH_CONTEXT },
+        ...conversation.messages.slice(-CHAT_HISTORY_LIMIT).map(m => ({
+          role: m.role,
+          content: m.content
+        }))
+      ]
+
+      const finalReply = await processSarahReply(chatMessages)
+
+      conversation.messages.push({
+        role: "assistant",
+        content: finalReply,
+        ts: new Date().toISOString()
+      })
+      conversation.updatedAt = new Date().toISOString()
+      writeConversation(conversation)
+
+      respondJson(res, 200, {
+        reply: finalReply,
+        conversationId: conversation.id,
+        title: conversation.title
+      })
+    } catch (err) {
+      console.error("Error:", err)
+      respondJson(res, 500, { error: (err as Error).message })
+    }
+  } else if (req.method === "POST" && req.url === "/chat") {
+    const user = getSessionUser(req.headers.cookie)
+    if (!user) {
+      respondJson(res, 401, { error: "Not authenticated" })
+      return
+    }
+
+    const bodyResult = await readJsonBody(req)
+    if (!bodyResult.ok) {
+      respondJson(res, bodyResult.status, { error: bodyResult.error })
+      return
+    }
+
+    const message = bodyResult.data.message || ""
+
+    if (!message) {
+      respondJson(res, 400, { error: "Message is required" })
+      return
+    }
+
+    try {
+      const history = memory.get(user.id) || []
+
+      history.push({
+        role: "user",
+        content: message
+      })
+
+      const chatMessages: Message[] = [
+        { role: "system", content: SARAH_CONTEXT },
+        ...history
+      ]
+
+      const finalReply = await processSarahReply(chatMessages)
+
+      history.push({
+        role: "assistant",
+        content: finalReply
+      })
+
+      memory.set(user.id, history)
+
+      respondJson(res, 200, { reply: finalReply })
+    } catch (err) {
+      console.error("Error:", err)
+      respondJson(res, 500, { error: (err as Error).message })
+    }
+  } else if (req.method === "GET" && new URL(req.url || "/", `http://${req.headers.host || "localhost"}`).pathname === "/webhook") {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`)
+    const mode = url.searchParams.get("hub.mode")
+    const token = url.searchParams.get("hub.verify_token")
+    const challenge = url.searchParams.get("hub.challenge")
+
+    if (mode === "subscribe" && token && token === process.env.INSTAGRAM_VERIFY_TOKEN) {
+      res.writeHead(200, {
+        "Content-Type": "text/plain; charset=utf-8"
+      })
+      res.end(challenge || "")
+    } else {
+      res.writeHead(403, {
+        "Content-Type": "text/plain; charset=utf-8"
+      })
+      res.end("Forbidden")
+    }
+  } else if (req.method === "POST" && new URL(req.url || "/", `http://${req.headers.host || "localhost"}`).pathname === "/webhook") {
     let body = ""
 
     req.on("data", (chunk: string) => {
       body += chunk
     })
 
-    req.on("end", async () => {
+    req.on("end", () => {
       try {
         const parsed = JSON.parse(body)
-        const userId = parsed.userId || "anonymous"
-        const message = parsed.message || ""
 
-        if (!message) {
-          res.writeHead(400, {
-            "Content-Type": "application/json; charset=utf-8"
+        console.log("Instagram webhook event received:", JSON.stringify({
+          object: parsed.object,
+          entryCount: Array.isArray(parsed.entry) ? parsed.entry.length : 0,
+          entries: Array.isArray(parsed.entry)
+            ? parsed.entry.map((entry: any) => ({
+                id: entry.id,
+                time: entry.time,
+                messagingCount: Array.isArray(entry.messaging) ? entry.messaging.length : 0
+              }))
+            : []
+        }))
+      } catch (parseErr) {
+        console.error("Instagram webhook parse failed:", (parseErr as Error).message)
+      }
+
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8"
+      })
+      res.end(JSON.stringify({ status: "EVENT_RECEIVED" }))
+    })
+  } else if ((req.method === "GET" || req.method === "DELETE") && req.url && req.url.startsWith("/api/conversations")) {
+    const user = getSessionUser(req.headers.cookie)
+    if (!user) {
+      respondJson(res, 401, { error: "Not authenticated" })
+      return
+    }
+
+    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`)
+    const parts = url.pathname.split("/").filter(Boolean)
+
+    if (req.method === "GET" && parts.length === 2) {
+      const conversations = listConversationsForUser(user.id)
+      respondJson(res, 200, {
+        conversations: conversations.map(c => ({
+          id: c.id,
+          title: c.title,
+          createdAt: c.createdAt,
+          updatedAt: c.updatedAt
+        }))
+      })
+      return
+    }
+
+    if (parts.length === 3) {
+      const conversation = readConversation(parts[2])
+
+      if (!conversation || conversation.userId !== user.id) {
+        respondJson(res, 404, { error: "Conversation not found." })
+        return
+      }
+
+      if (req.method === "GET") {
+        respondJson(res, 200, { conversation })
+      } else {
+        deleteConversation(conversation.id)
+        respondJson(res, 200, { ok: true })
+      }
+      return
+    }
+
+    respondJson(res, 404, { error: "Not found" })
+  } else if (req.method === "GET") {
+    const pathname = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`).pathname
+    const staticFile = STATIC_FILES[pathname]
+
+    if (staticFile) {
+      fs.readFile(path.join(PUBLIC_DIR, staticFile.file), (err, data) => {
+        if (err) {
+          res.writeHead(404, {
+            "Content-Type": "text/plain; charset=utf-8"
           })
-          res.end(JSON.stringify({ error: "Message is required" }))
+          res.end("Not found")
           return
         }
-
-        const history = memory.get(userId) || []
-
-        history.push({
-          role: "user",
-          content: message
-        })
-
-        const systemMessage: Message = {
-          role: "system",
-          content: SARAH_CONTEXT
-        }
-
-        const chatMessages: Message[] = [
-          systemMessage,
-          ...history
-        ]
-
-        const llmProvider = (process.env.LLM_PROVIDER || "gemini").toLowerCase()
-
-        let reply: string
-        try {
-          if (llmProvider === "gemini") {
-            const geminiClient = new GeminiClient()
-            reply = await geminiClient.getReply(chatMessages)
-          } else {
-            const nvidiaClient = new NVIDIAClient()
-            reply = await nvidiaClient.getReply(chatMessages)
-          }
-        } catch (providerErr) {
-          if (llmProvider === "gemini") {
-            console.log("Gemini failed, falling back to NVIDIA:", (providerErr as Error).message)
-            const nvidiaClient = new NVIDIAClient()
-            reply = await nvidiaClient.getReply(chatMessages)
-          } else {
-            throw providerErr
-          }
-        }
-
-        const forbiddenIdentityPatterns = [
-          /\bnemotron\b/i,
-          /\bnvidia\b/i,
-          /\bmodel\b/i,
-          /\bllm\b/i,
-          /\bbackend\b/i,
-          /\bapi\b/i,
-          /\bunderlying model\b/i,
-          /\bapi provider\b/i,
-          /\bprovider\b/i,
-          /\bsystem prompt\b/i,
-          /\bsystem instructions\b/i,
-          /\bdeveloper\b/i,
-          /\bdeveloper instructions\b/i,
-          /\btechnical implementation\b/i,
-          /نيموتر/i,
-          /نيموترون/i,
-          /نفيديا/i,
-          /إنفيديا/i
-        ]
-
-        const matchedForbiddenPatterns = forbiddenIdentityPatterns
-          .filter(pattern => pattern.test(reply))
-          .map(pattern => pattern.source)
-
-        const hasForbiddenIdentity = matchedForbiddenPatterns.length > 0
-
-        if (hasForbiddenIdentity) {
-          console.log(`Identity guard: reply blocked (matched: ${matchedForbiddenPatterns.join(", ")})`)
-          reply = "أنا سارة 🤍 المساعدة بتاعة Youth Science Club. لو بتسألني أنا مين، فأنا هنا عشان أساعدك في كل حاجة تخص النادي وأنشطته ومجتمعه."
-        }
-
-        let finalReply = reply
-
-        const applicationMatch = reply.match(/\[\[APPLICATION\]\]\s*([\s\S]*?)\s*\[\[\/APPLICATION\]\]/)
-
-        if (applicationMatch) {
-          finalReply = reply.replace(/\[\[APPLICATION\]\][\s\S]*?\[\[\/APPLICATION\]\]/, "").trim()
-
-          try {
-            const application = JSON.parse(applicationMatch[1]) as InterestApplication
-
-            const logLine = JSON.stringify({
-              receivedAt: new Date().toISOString(),
-              application
-            })
-            fs.appendFileSync("applications.log", logLine + "\n", "utf8")
-            console.log("Application collected and stored")
-
-            if (isMailerConfigured()) {
-              try {
-                await sendInterestEmail(application)
-                console.log("Application email sent")
-              } catch (mailErr) {
-                console.error("Application email failed:", (mailErr as Error).message)
-              }
-            } else {
-              console.log("Mailer not configured - application stored in applications.log only")
-            }
-          } catch (parseErr) {
-            console.error("Application block parse failed:", (parseErr as Error).message)
-          }
-        }
-
-        history.push({
-          role: "assistant",
-          content: finalReply
-        })
-
-        memory.set(userId, history)
-
         res.writeHead(200, {
-          "Content-Type": "application/json; charset=utf-8"
+          "Content-Type": staticFile.type,
+          "Cache-Control": "no-cache"
         })
-
-        res.end(JSON.stringify({ reply: finalReply }))
-      } catch (err) {
-        console.error("Error:", err)
-
-        res.writeHead(500, {
-          "Content-Type": "application/json; charset=utf-8"
-        })
-
-        res.end(
-          JSON.stringify({
-            error: (err as Error).message
-          })
-        )
-      }
-    })
+        res.end(data)
+      })
+    } else {
+      res.writeHead(404, {
+        "Content-Type": "text/plain; charset=utf-8"
+      })
+      res.end("Not found")
+    }
   } else {
     res.writeHead(404, {
       "Content-Type": "text/plain; charset=utf-8"

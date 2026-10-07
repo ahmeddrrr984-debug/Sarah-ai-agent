@@ -22,10 +22,10 @@ export function isMailerConfigured(): boolean {
   )
 }
 
-export async function sendInterestEmail(application: InterestApplication): Promise<void> {
+function createTransporter() {
   const port = Number(process.env.SMTP_PORT)
 
-  const transporter = nodemailer.createTransport({
+  return nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port,
     secure: port === 465,
@@ -34,6 +34,33 @@ export async function sendInterestEmail(application: InterestApplication): Promi
       pass: process.env.SMTP_PASS
     }
   })
+}
+
+export async function sendPasswordResetCode(email: string, code: string, fullName: string): Promise<void> {
+  const transporter = createTransporter()
+
+  const subject = "YSC Sarah - Password Reset Code"
+
+  const text = [
+    `Hi ${fullName},`,
+    ``,
+    `You requested a password reset for your Sarah (Youth Science Club) account.`,
+    `Your verification code is: ${code}`,
+    `This code expires in 15 minutes and can only be used once.`,
+    ``,
+    `If you did not request this, you can safely ignore this email.`
+  ].join("\n")
+
+  await transporter.sendMail({
+    from: process.env.SMTP_USER,
+    to: email,
+    subject,
+    text
+  })
+}
+
+export async function sendInterestEmail(application: InterestApplication): Promise<void> {
+  const transporter = createTransporter()
 
   const to = process.env.INTEREST_EMAIL_TO || "sarahyouthscienceclub@gmail.com"
   const subject = `New YSC Interest/Application - ${application.fullName} - ${application.request}`
