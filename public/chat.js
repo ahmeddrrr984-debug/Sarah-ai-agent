@@ -334,6 +334,12 @@
     app.$("userName").textContent = app.state.user.fullName
     app.$("userEmail").textContent = app.state.user.email
 
+    if (app.state.user.role === "admin") {
+      app.show(app.$("adminLink"))
+    } else {
+      app.hide(app.$("adminLink"))
+    }
+
     app.useSarahImage(app.$("sidebarSarahImg"), app.$("sidebarSarahFallback"))
     app.useSarahImage(app.$("welcomeSarahImg"), app.$("welcomeSarahFallback"))
 

@@ -11,7 +11,8 @@ import {
   normalizeEmail,
   generateId,
   persistSessions,
-  revokeAllSessionsForUser
+  revokeAllSessionsForUser,
+  isAdminEmail
 } from "./storage"
 
 const SCRYPT_N = 16384
@@ -152,13 +153,19 @@ export type PublicUser = {
   id: string
   fullName: string
   email: string
+  role: string
+}
+
+export function isAdmin(user: UserRecord): boolean {
+  return user.role === "admin" || isAdminEmail(user.email)
 }
 
 export function toPublicUser(user: UserRecord): PublicUser {
   return {
     id: user.id,
     fullName: user.fullName,
-    email: user.email
+    email: user.email,
+    role: isAdmin(user) ? "admin" : "user"
   }
 }
 

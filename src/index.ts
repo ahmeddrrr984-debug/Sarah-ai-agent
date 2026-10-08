@@ -7,8 +7,13 @@ import { isMailerConfigured, sendInterestEmail, sendPasswordResetCode, InterestA
 import {
   ConversationRecord,
   findUserByEmail,
+  findUserById,
   generateId,
+  listApplications,
+  listConversationIds,
   listConversationsForUser,
+  listUsers,
+  countConversationsByUser,
   readConversation,
   writeConversation,
   deleteConversation
@@ -24,6 +29,7 @@ import {
   sessionCookieHeader,
   clearSessionCookieHeader,
   toPublicUser,
+  isAdmin,
   issuePasswordReset,
   consumePasswordReset
 } from "./auth"
@@ -416,6 +422,9 @@ const STATIC_FILES: Record<string, { file: string; type: string }> = {
   "/app.js": { file: "app.js", type: "text/javascript; charset=utf-8" },
   "/auth.js": { file: "auth.js", type: "text/javascript; charset=utf-8" },
   "/chat.js": { file: "chat.js", type: "text/javascript; charset=utf-8" },
+  "/admin.html": { file: "admin.html", type: "text/html; charset=utf-8" },
+  "/admin.css": { file: "admin.css", type: "text/css; charset=utf-8" },
+  "/admin.js": { file: "admin.js", type: "text/javascript; charset=utf-8" },
   "/sarah.png": { file: "sarah.png", type: "image/png" },
   "/favicon.svg": { file: "favicon.svg", type: "image/svg+xml" }
 }
@@ -921,6 +930,85 @@ const server = http.createServer(async (req, res) => {
         deleteConversation(conversation.id)
         respondJson(res, 200, { ok: true })
       }
+      return
+    }
+
+    respondJson(res, 404, { error: "Not found" })
+  } else if (req.url && req.url.startsWith("/api/admin")) {
+    const sessionUser = getSessionUser(req.headers.cookie)
+    if (!sessionUser) {
+      respondJson(res, 401, { error: "Not authenticated" })
+      return
+    }
+    if (!isAdmin(sessionUser)) {
+      respondJson(res, 403, { error: "Forbidden" })
+      return
+    }
+
+    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`)
+    const parts = url.pathname.split("/").filter(Boolean)
+
+    if (req.method === "GET" && parts.length === 3 && parts[2] === "stats") {
+      respondJson(res, 200, {
+        totalUsers: listUsers().length,
+        totalConversations: listConversationIds().length,
+        totalApplications: listApplications().length
+      })
+      return
+    }
+
+    if (req.method === "GET" && parts.length === 3 && parts[2] === "users") {
+      const counts = countConversationsByUser()
+      const users = listUsers().map(u => ({
+        id: u.id,
+        fullName: u.fullName,
+        email: u.email,
+        createdAt: u.createdAt,
+        role: isAdmin(u) ? "admin" : "user",
+        conversationCount: counts.get(u.id) || 0
+      }))
+      respondJson(res, 200, { users })
+      return
+    }
+
+    if (req.method === "GET" && parts.length === 4 && parts[2] === "users") {
+      const target = findUserById(parts[3])
+      if (!target) {
+        respondJson(res, 404, { error: "User not found." })
+        return
+      }
+      const conversations = listConversationsForUser(target.id).map(c => ({
+        id: c.id,
+        title: c.title,
+        createdAt: c.createdAt,
+        updatedAt: c.updatedAt,
+        messageCount: c.messages.length
+      }))
+      respondJson(res, 200, {
+        user: {
+          id: target.id,
+          fullName: target.fullName,
+          email: target.email,
+          createdAt: target.createdAt,
+          role: isAdmin(target) ? "admin" : "user"
+        },
+        conversations
+      })
+      return
+    }
+
+    if (req.method === "GET" && parts.length === 4 && parts[2] === "conversations") {
+      const conversation = readConversation(parts[3])
+      if (!conversation) {
+        respondJson(res, 404, { error: "Conversation not found." })
+        return
+      }
+      respondJson(res, 200, { conversation })
+      return
+    }
+
+    if (req.method === "GET" && parts.length === 3 && parts[2] === "applications") {
+      respondJson(res, 200, { applications: listApplications() })
       return
     }
 

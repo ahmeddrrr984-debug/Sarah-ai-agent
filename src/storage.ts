@@ -6,6 +6,7 @@ const DATA_DIR = path.join(__dirname, "..", "data")
 const CONVERSATIONS_DIR = path.join(DATA_DIR, "conversations")
 const USERS_FILE = path.join(DATA_DIR, "users.json")
 const SESSIONS_FILE = path.join(DATA_DIR, "sessions.json")
+const ADMINS_FILE = path.join(DATA_DIR, "admins.json")
 
 export type UserRecord = {
   id: string
@@ -13,9 +14,26 @@ export type UserRecord = {
   email: string
   passwordHash: string
   createdAt: string
+  role?: "user" | "admin"
   resetCodeHash?: string
   resetCodeExpiresAt?: number
   resetCodeAttempts?: number
+}
+
+export type ApplicationEntry = {
+  receivedAt: string
+  application: {
+    fullName: string
+    phone: string
+    email: string
+    university: string
+    faculty: string
+    academicYear: string
+    request: string
+    role?: string
+    skills?: string
+    notes?: string
+  }
 }
 
 export type SessionRecord = {
@@ -158,6 +176,70 @@ export function listConversationIds(): string[] {
     .readdirSync(CONVERSATIONS_DIR)
     .filter(f => f.endsWith(".json"))
     .map(f => f.slice(0, -".json".length))
+}
+
+export function listUsers(): UserRecord[] {
+  return users.slice()
+}
+
+export function countConversationsByUser(): Map<string, number> {
+  const counts = new Map<string, number>()
+  for (const id of listConversationIds()) {
+    const conversation = readConversation(id)
+    if (conversation) {
+      counts.set(conversation.userId, (counts.get(conversation.userId) || 0) + 1)
+    }
+  }
+  return counts
+}
+
+export function isAdminEmail(email: string): boolean {
+  if (!fs.existsSync(ADMINS_FILE)) return false
+  try {
+    const parsed = JSON.parse(fs.readFileSync(ADMINS_FILE, "utf8")) as { emails?: string[] }
+    const emails = Array.isArray(parsed.emails) ? parsed.emails : []
+    return emails.includes(normalizeEmail(email))
+  } catch {
+    return false
+  }
+}
+
+export function addAdminEmail(email: string): void {
+  let emails: string[] = []
+  if (fs.existsSync(ADMINS_FILE)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(ADMINS_FILE, "utf8")) as { emails?: string[] }
+      if (Array.isArray(parsed.emails)) {
+        emails = parsed.emails
+      }
+    } catch {
+      emails = []
+    }
+  }
+  const normalized = normalizeEmail(email)
+  if (!emails.includes(normalized)) {
+    emails.push(normalized)
+  }
+  atomicWriteFile(ADMINS_FILE, JSON.stringify({ emails }, null, 2))
+}
+
+export function listApplications(): ApplicationEntry[] {
+  if (!fs.existsSync("applications.log")) return []
+  const lines = fs.readFileSync("applications.log", "utf8").split("\n")
+  const result: ApplicationEntry[] = []
+  for (const line of lines) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    try {
+      const parsed = JSON.parse(trimmed)
+      if (parsed && parsed.application) {
+        result.push(parsed as ApplicationEntry)
+      }
+    } catch {
+      // skip malformed lines
+    }
+  }
+  return result.sort((a, b) => (a.receivedAt < b.receivedAt ? 1 : -1))
 }
 
 export function readConversation(id: string): ConversationRecord | null {
